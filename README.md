@@ -21,6 +21,8 @@ Edit `config.json`:
     - `id` required: model identifier used by clients (e.g., `glm`)
     - `display_name` optional: display name (defaults to `id` if not provided)
     - `remote_id` optional: model ID sent to upstream service (defaults to `id` if not provided)
+- `tavily_key` optional: Tavily API key for web tools support.
+- `tavily_url` optional: Tavily base URL (defaults to `https://api.tavily.com`).
 
 Example:
 
@@ -31,6 +33,7 @@ Example:
   "upstream_timeout_seconds": 300,
   "log_body_max_chars": 4096,
   "log_stream_text_preview_chars": 256,
+  "tavily_key": "tvly-...",
   "providers": [
     {
       "base_url": "https://api.example.com",
@@ -56,7 +59,16 @@ Do not commit your real `ak` or `api_key` values.
 
 ## Env
 
-- `CONFIG_PATH` default `config.json` (relative to working directory)
+Environment variables can override or complement `config.json`:
+
+- `CONFIG_PATH`: path to config file (default `config.json`)
+- `TAVILY_API_KEY`: overrides `tavily_key` in config
+- `TAVILY_BASE_URL`: overrides `tavily_url` in config
+- `TAVILY_PROXY_ADDRESS` or `LOCAL_PROXY_ADDRESS`: proxy for Tavily requests
+- `TAVILY_MAX_RESULTS`: max search results (default `5`, max `20`)
+- `TAVILY_SEARCH_DEPTH`: `basic` or `advanced` (default `basic`)
+- `TAVILY_TOPIC`: `general`, `news`, or `finance` (default `general`)
+- `TAVILY_FETCH_MAX_CHARS`: max characters for `web_fetch` (default `50000`, min `1000`)
 
 ## Run
 
@@ -84,17 +96,6 @@ export ANTHROPIC_DEFAULT_OPUS_MODEL=glm
 claude
 ```
 
-use minimax model:
-```bash
-export ANTHROPIC_BASE_URL=http://localhost:8888
-export ANTHROPIC_AUTH_TOKEN=your-proxy-api-key
-export ANTHROPIC_DEFAULT_HAIKU_MODEL=minimax
-export ANTHROPIC_DEFAULT_SONNET_MODEL=minimax
-export ANTHROPIC_DEFAULT_OPUS_MODEL=minimax
-
-claude
-```
-
 ## API
 
 ### GET /v1/models
@@ -115,22 +116,9 @@ Response format (Anthropic style):
       "object": "model",
       "created": 1234567890,
       "display_name": "glm4.7"
-    },
-    {
-      "id": "minimax",
-      "object": "model",
-      "created": 1234567890,
-      "display_name": "minimax2.1"
     }
   ]
 }
-```
-
-Example:
-
-```bash
-curl -sS http://127.0.0.1:8888/v1/models \
-  -H 'Authorization: Bearer your-proxy-api-key'
 ```
 
 ### POST /v1/messages
@@ -141,9 +129,8 @@ Sends a message to the upstream service.
   - If `ak` is set in config, you must send `Authorization: Bearer <ak>` (or `x-api-key: <ak>`).
 - Upstream auth:
   - Always sends `Authorization: Bearer <api_key>` to upstream.
-- Model mapping:
-  - The `model` field in the request uses the client-side `id` (e.g., `glm`)
-  - The proxy converts it to the upstream `remote_id` (e.g., `deepseek-chat`) before forwarding
+- Web Tools:
+  - Supports `web_search` and `web_fetch` if `tavily_key` or `TAVILY_API_KEY` is provided.
 
 Example (non-stream):
 
@@ -158,21 +145,7 @@ curl -sS http://127.0.0.1:8888/v1/messages \
   }'
 ```
 
-Example (stream):
-
-```bash
-curl -N http://127.0.0.1:8888/v1/messages \
-  -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer your-proxy-api-key' \
-  -d '{
-    "model": "glm",
-    "max_tokens": 256,
-    "stream": true,
-    "messages": [{"role": "user", "content": "hello"}]
-  }'
-```
-
-### GET /
+### GET /status
 
 Health check endpoint.
 
@@ -187,39 +160,23 @@ Response:
 
 ## Build
 
-This project uses only Go stdlib (no external deps). If your environment blocks the default Go build cache path, set:
-
-```bash
-export GOCACHE=/tmp/tmp-go-build-cache
-export GOMODCACHE=/tmp/tmp-gomodcache
-```
+This project uses only Go stdlib (no external deps).
 
 Linux (amd64):
-
 ```bash
-mkdir -p dist
 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/claude-proxy_linux_amd64 .
 ```
 
 Windows (amd64):
-
 ```bash
-mkdir -p dist
 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/claude-proxy_windows_amd64.exe .
-```
-
-macOS (arm64):
-
-```bash
-mkdir -p dist
-GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o dist/claude-proxy_darwin_arm64 .
 ```
 
 ## Notes / Limitations
 
-- Multiple providers can be configured, each with their own `base_url`, `api_key`, and models
-- Model IDs are mapped from client-side `id` to upstream `remote_id` before forwarding requests
-- Streaming conversion supports `delta.content` text and `delta.tool_calls` tool-use blocks; other Anthropic blocks are not fully implemented
-- Logs show forwarded request bodies; keep `log_body_max_chars` small and avoid secrets in prompts
-- The `/v1/models` endpoint returns a static list from config, not from the upstream service
-- All configuration is read from `config.json`; environment variable overrides are not supported (except `CONFIG_PATH`)
+- Multiple providers can be configured, each with their own `base_url`, `api_key`, and models.
+- Web tools (`web_search`, `web_fetch`) are powered by Tavily and require an API key.
+- Streaming conversion supports `delta.content` text and `delta.tool_calls` tool-use blocks.
+- Logs show forwarded request bodies; keep `log_body_max_chars` small.
+- The `/v1/models` endpoint returns a static list from config.
+
