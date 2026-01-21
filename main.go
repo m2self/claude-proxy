@@ -13,24 +13,45 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 )
 
+type providerConfig struct {
+	BaseURL string        `json:"base_url"`
+	APIKey  string        `json:"api_key"`
+	Models  []modelConfig `json:"models"`
+}
+
+type modelConfig struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+	RemoteID    string `json:"remote_id"`
+}
+
 type fileConfig struct {
-	NvidiaURL string `json:"nvidia_url"`
-	NvidiaKey string `json:"nvidia_key"`
+	AK                        string           `json:"ak"`
+	Port                      int              `json:"port"`
+	UpstreamTimeoutSeconds    int              `json:"upstream_timeout_seconds"`
+	LogBodyMaxChars           int              `json:"log_body_max_chars"`
+	LogStreamTextPreviewChars int              `json:"log_stream_text_preview_chars"`
+	Providers                 []providerConfig `json:"providers"`
 }
 
 type serverConfig struct {
-	addr           string
-	upstreamURL    string
-	providerAPIKey string
-	serverAPIKey   string
-	timeout        time.Duration
-	logBodyMax     int
+	addr                string
+	serverAPIKey        string
+	timeout             time.Duration
+	logBodyMax          int
 	logStreamPreviewMax int
+	providers           []providerConfig
+	modelMap            map[string]modelMapping
+}
+
+type modelMapping struct {
+	ProviderIndex int
+	RemoteID      string
+	DisplayName   string
 }
 
 func main() {
@@ -40,13 +61,16 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) {
+		handleModels(w, r, cfg)
+	})
 	mux.HandleFunc("POST /v1/messages", func(w http.ResponseWriter, r *http.Request) {
 		handleMessages(w, r, cfg)
 	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/status", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"message": "claude-nvidia-proxy",
+			"message": "claude-proxy",
 			"health":  "ok",
 		})
 	})
@@ -61,7 +85,10 @@ func main() {
 	}
 
 	log.Printf("listening on %s", cfg.addr)
-	log.Printf("upstream: %s", cfg.upstreamURL)
+	log.Printf("providers: %d", len(cfg.providers))
+	for i, p := range cfg.providers {
+		log.Printf("  provider[%d]: %s (models: %d)", i, p.BaseURL, len(p.Models))
+	}
 	if cfg.serverAPIKey != "" {
 		log.Printf("inbound auth: enabled")
 	} else {
@@ -76,52 +103,72 @@ func loadConfig() (*serverConfig, error) {
 		return nil, err
 	}
 
-	addr := strings.TrimSpace(envOr("ADDR", ":3001"))
-	upstreamURL := strings.TrimSpace(envOr("UPSTREAM_URL", fc.NvidiaURL))
-	providerAPIKey := strings.TrimSpace(envOr("PROVIDER_API_KEY", fc.NvidiaKey))
-	serverAPIKey := strings.TrimSpace(envOr("SERVER_API_KEY", ""))
+	port := 8888
+	if fc.Port > 0 {
+		port = fc.Port
+	}
+	addr := fmt.Sprintf(":%d", port)
+
+	serverAPIKey := fc.AK
 
 	timeout := 5 * time.Minute
-	if raw := strings.TrimSpace(envOr("UPSTREAM_TIMEOUT_SECONDS", "")); raw != "" {
-		seconds, err := strconv.Atoi(raw)
-		if err != nil || seconds <= 0 {
-			return nil, fmt.Errorf("invalid UPSTREAM_TIMEOUT_SECONDS: %q", raw)
-		}
-		timeout = time.Duration(seconds) * time.Second
+	if fc.UpstreamTimeoutSeconds > 0 {
+		timeout = time.Duration(fc.UpstreamTimeoutSeconds) * time.Second
 	}
 
 	logBodyMax := 4096
-	if raw := strings.TrimSpace(envOr("LOG_BODY_MAX_CHARS", "")); raw != "" {
-		n, err := strconv.Atoi(raw)
-		if err != nil || n < 0 {
-			return nil, fmt.Errorf("invalid LOG_BODY_MAX_CHARS: %q", raw)
-		}
-		logBodyMax = n
+	if fc.LogBodyMaxChars > 0 {
+		logBodyMax = fc.LogBodyMaxChars
 	}
 
 	logStreamPreviewMax := 256
-	if raw := strings.TrimSpace(envOr("LOG_STREAM_TEXT_PREVIEW_CHARS", "")); raw != "" {
-		n, err := strconv.Atoi(raw)
-		if err != nil || n < 0 {
-			return nil, fmt.Errorf("invalid LOG_STREAM_TEXT_PREVIEW_CHARS: %q", raw)
-		}
-		logStreamPreviewMax = n
+	if fc.LogStreamTextPreviewChars > 0 {
+		logStreamPreviewMax = fc.LogStreamTextPreviewChars
 	}
 
-	if upstreamURL == "" {
-		return nil, errors.New("missing nvidia_url in config.json (or UPSTREAM_URL)")
+	if len(fc.Providers) == 0 {
+		return nil, errors.New("no providers configured in config.json")
 	}
-	if providerAPIKey == "" {
-		return nil, errors.New("missing nvidia_key in config.json (or PROVIDER_API_KEY)")
+
+	modelMap := make(map[string]modelMapping)
+	for i, p := range fc.Providers {
+		if p.BaseURL == "" {
+			return nil, fmt.Errorf("provider[%d]: missing base_url", i)
+		}
+		if p.APIKey == "" {
+			return nil, fmt.Errorf("provider[%d]: missing api_key", i)
+		}
+		for j, m := range p.Models {
+			if m.ID == "" {
+				return nil, fmt.Errorf("provider[%d].models[%d]: missing id", i, j)
+			}
+			if _, exists := modelMap[m.ID]; exists {
+				return nil, fmt.Errorf("duplicate model id: %q", m.ID)
+			}
+			remoteID := m.RemoteID
+			if remoteID == "" {
+				remoteID = m.ID
+			}
+			displayName := m.DisplayName
+			if displayName == "" {
+				displayName = m.ID
+			}
+			modelMap[m.ID] = modelMapping{
+				ProviderIndex: i,
+				RemoteID:      remoteID,
+				DisplayName:   displayName,
+			}
+		}
 	}
+
 	return &serverConfig{
-		addr:           addr,
-		upstreamURL:    upstreamURL,
-		providerAPIKey: providerAPIKey,
-		serverAPIKey:   serverAPIKey,
-		timeout:        timeout,
-		logBodyMax:     logBodyMax,
+		addr:                addr,
+		serverAPIKey:        serverAPIKey,
+		timeout:             timeout,
+		logBodyMax:          logBodyMax,
 		logStreamPreviewMax: logStreamPreviewMax,
+		providers:           fc.Providers,
+		modelMap:            modelMap,
 	}, nil
 }
 
@@ -144,6 +191,30 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
+func handleModels(w http.ResponseWriter, r *http.Request, cfg *serverConfig) {
+	if cfg.serverAPIKey != "" && !checkInboundAuth(r, cfg.serverAPIKey) {
+		log.Printf("models endpoint: unauthorized")
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	data := make([]map[string]any, 0, len(cfg.modelMap))
+	for id, mapping := range cfg.modelMap {
+		data = append(data, map[string]any{
+			"id":           id,
+			"object":       "model",
+			"created":      1234567890,
+			"display_name": mapping.DisplayName,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"object": "list",
+		"data":   data,
+	})
+}
+
 func handleMessages(w http.ResponseWriter, r *http.Request, cfg *serverConfig) {
 	reqID := fmt.Sprintf("req_%d", time.Now().UnixNano())
 	if cfg.serverAPIKey != "" && !checkInboundAuth(r, cfg.serverAPIKey) {
@@ -163,8 +234,18 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *serverConfig) {
 		writeJSONError(w, http.StatusBadRequest, "missing_model")
 		return
 	}
+
+	modelID := strings.TrimSpace(anthropicReq.Model)
+	mapping, exists := cfg.modelMap[modelID]
+	if !exists {
+		log.Printf("[%s] unknown model: %s", reqID, modelID)
+		writeJSONError(w, http.StatusBadRequest, "unknown_model")
+		return
+	}
+
+	anthropicReq.Model = mapping.RemoteID
+
 	if anthropicReq.MaxTokens == 0 {
-		// Anthropic requires max_tokens; NVIDIA/OpenAI also expects it. Default conservatively.
 		anthropicReq.MaxTokens = 1024
 	}
 
@@ -175,16 +256,19 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *serverConfig) {
 		return
 	}
 
-	logForwardedRequest(reqID, cfg, anthropicReq, openaiReq)
+	provider := cfg.providers[mapping.ProviderIndex]
+	upstreamURL := strings.TrimSuffix(provider.BaseURL, "/") + "/v1/chat/completions"
+
+	logForwardedRequest(reqID, cfg, anthropicReq, openaiReq, upstreamURL)
 
 	if anthropicReq.Stream {
-		if err := proxyStream(w, r, cfg, reqID, openaiReq); err != nil {
-			log.Printf("[%s] stream proxy error: %v", reqID, err)
+		if streamErr := proxyStream(w, r, cfg, reqID, openaiReq, upstreamURL, provider.APIKey); streamErr != nil {
+			log.Printf("[%s] stream proxy error: %v", reqID, streamErr)
 		}
 		return
 	}
 
-	openaiRespBody, resp, err := doUpstreamJSON(r.Context(), cfg, openaiReq)
+	openaiRespBody, resp, err := doUpstreamJSON(r.Context(), cfg, openaiReq, upstreamURL, provider.APIKey)
 	if err != nil {
 		log.Printf("[%s] upstream request failed: %v", reqID, err)
 		writeJSONError(w, http.StatusBadGateway, "upstream_request_failed")
@@ -224,19 +308,19 @@ func checkInboundAuth(r *http.Request, expected string) bool {
 	return false
 }
 
-func doUpstreamJSON(ctx context.Context, cfg *serverConfig, openaiReq openaiChatCompletionRequest) ([]byte, *http.Response, error) {
+func doUpstreamJSON(ctx context.Context, cfg *serverConfig, openaiReq openaiChatCompletionRequest, upstreamURL string, apiKey string) ([]byte, *http.Response, error) {
 	bodyBytes, err := json.Marshal(openaiReq)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.upstreamURL, bytes.NewReader(bodyBytes))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, nil, err
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+cfg.providerAPIKey)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
 
 	client := &http.Client{Timeout: cfg.timeout}
 	resp, err := client.Do(req)
@@ -250,24 +334,23 @@ func doUpstreamJSON(ctx context.Context, cfg *serverConfig, openaiReq openaiChat
 		return nil, nil, err
 	}
 	_ = resp.Body.Close()
-	// Re-wrap body so caller can optionally read again after status checks.
 	resp.Body = io.NopCloser(bytes.NewReader(respBody))
 	return respBody, resp, nil
 }
 
-func proxyStream(w http.ResponseWriter, r *http.Request, cfg *serverConfig, reqID string, openaiReq openaiChatCompletionRequest) error {
+func proxyStream(w http.ResponseWriter, r *http.Request, cfg *serverConfig, reqID string, openaiReq openaiChatCompletionRequest, upstreamURL string, apiKey string) error {
 	openaiReq.Stream = true
 
 	bodyBytes, err := json.Marshal(openaiReq)
 	if err != nil {
 		return err
 	}
-	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, cfg.upstreamURL, bytes.NewReader(bodyBytes))
+	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return err
 	}
 	upReq.Header.Set("Content-Type", "application/json")
-	upReq.Header.Set("Authorization", "Bearer "+cfg.providerAPIKey)
+	upReq.Header.Set("Authorization", "Bearer "+apiKey)
 
 	client := &http.Client{Timeout: 0} // streaming: no client timeout
 	upResp, err := client.Do(upReq)
@@ -897,7 +980,7 @@ type openaiChatCompletionResponse struct {
 	Model   string `json:"model"`
 	Choices []struct {
 		Message struct {
-			Role      string `json:"role"`
+			Role      string  `json:"role"`
 			Content   *string `json:"content"`
 			ToolCalls []struct {
 				ID       string `json:"id"`
@@ -911,8 +994,8 @@ type openaiChatCompletionResponse struct {
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage *struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
+		PromptTokens        int `json:"prompt_tokens"`
+		CompletionTokens    int `json:"completion_tokens"`
 		PromptTokensDetails *struct {
 			CachedTokens int `json:"cached_tokens"`
 		} `json:"prompt_tokens_details,omitempty"`
@@ -968,7 +1051,6 @@ func convertOpenAIToAnthropic(resp openaiChatCompletionResponse) anthropicMessag
 	outputTokens := 0
 	cacheRead := 0
 	if resp.Usage != nil {
-		cacheRead = 0
 		if resp.Usage.PromptTokensDetails != nil {
 			cacheRead = resp.Usage.PromptTokensDetails.CachedTokens
 		}
@@ -977,16 +1059,16 @@ func convertOpenAIToAnthropic(resp openaiChatCompletionResponse) anthropicMessag
 	}
 
 	return anthropicMessageResponse{
-		ID:    resp.ID,
-		Type:  "message",
-		Role:  "assistant",
-		Model: resp.Model,
-		Content: content,
-		StopReason: mapFinishReason(finishReason),
+		ID:           resp.ID,
+		Type:         "message",
+		Role:         "assistant",
+		Model:        resp.Model,
+		Content:      content,
+		StopReason:   mapFinishReason(finishReason),
 		StopSequence: nil,
 		Usage: map[string]any{
-			"input_tokens":           inputTokens,
-			"output_tokens":          outputTokens,
+			"input_tokens":            inputTokens,
+			"output_tokens":           outputTokens,
 			"cache_read_input_tokens": cacheRead,
 		},
 	}
@@ -1003,9 +1085,6 @@ func mapFinishReason(finish string) string {
 	case "content_filter":
 		return "stop_sequence"
 	default:
-		if finish == "" {
-			return "end_turn"
-		}
 		return "end_turn"
 	}
 }
@@ -1015,14 +1094,14 @@ func mapFinishReason(finish string) string {
 // ----------------------
 
 type openaiChatCompletionChunk struct {
-	Model  string `json:"model,omitempty"`
+	Model   string `json:"model,omitempty"`
 	Choices []struct {
 		Delta struct {
-			Content *string `json:"content,omitempty"`
+			Content   *string `json:"content,omitempty"`
 			ToolCalls []struct {
-				Index int `json:"index,omitempty"`
-				ID    string `json:"id,omitempty"`
-				Type  string `json:"type,omitempty"`
+				Index    int    `json:"index,omitempty"`
+				ID       string `json:"id,omitempty"`
+				Type     string `json:"type,omitempty"`
 				Function struct {
 					Name      string `json:"name,omitempty"`
 					Arguments string `json:"arguments,omitempty"`
@@ -1033,7 +1112,7 @@ type openaiChatCompletionChunk struct {
 	} `json:"choices"`
 }
 
-func logForwardedRequest(reqID string, cfg *serverConfig, anthropicReq anthropicMessageRequest, openaiReq openaiChatCompletionRequest) {
+func logForwardedRequest(reqID string, cfg *serverConfig, anthropicReq anthropicMessageRequest, openaiReq openaiChatCompletionRequest, upstreamURL string) {
 	inSummary := map[string]any{
 		"model":      anthropicReq.Model,
 		"max_tokens": anthropicReq.MaxTokens,
@@ -1044,7 +1123,7 @@ func logForwardedRequest(reqID string, cfg *serverConfig, anthropicReq anthropic
 	log.Printf("[%s] inbound summary=%s", reqID, mustJSONTrunc(inSummary, cfg.logBodyMax))
 
 	out := sanitizeOpenAIRequest(openaiReq)
-	log.Printf("[%s] forward url=%s", reqID, cfg.upstreamURL)
+	log.Printf("[%s] forward url=%s", reqID, upstreamURL)
 	log.Printf("[%s] forward headers=%s", reqID, mustJSONTrunc(map[string]any{
 		"Content-Type":  "application/json",
 		"Authorization": "Bearer <redacted>",

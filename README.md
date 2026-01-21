@@ -1,30 +1,62 @@
-# claude-nvidia-proxy (Go)
+# claude-proxy (Go)
 
-Go https://build.nvidia.com/explore/discover, register an account, and generate an API key. 
-NVIDIA provides two hidden models, z-ai/glm4.7 and minimaxai/minimax-m2.1
-Then, configure the config.json file and run the program, ensuring it listens on port 3001.
+A generic API proxy that converts Anthropic/Claude API requests to OpenAI Chat Completions format and forwards to any OpenAI-compatible upstream service.
 
-Expose `POST /v1/messages` (Anthropic/Claude style), convert to OpenAI Chat Completions, and proxy to NVIDIA (configured via `config.json`).
+Expose `POST /v1/messages` (Anthropic/Claude style), convert to OpenAI Chat Completions, and proxy to upstream (configured via `config.json`).
 
 ## Config
 
 Edit `config.json`:
 
-- `nvidia_url` default `https://integrate.api.nvidia.com/v1/chat/completions`
-- `nvidia_key` required: used for upstream auth, sent as `Authorization: Bearer ...`
+- `ak` optional: API key for inbound authentication. If set, clients must send `Authorization: Bearer <ak>` or `x-api-key: <ak>` header.
+- `port` optional: server port (default `8888`)
+- `upstream_timeout_seconds` optional: upstream request timeout in seconds (default `300`)
+- `log_body_max_chars` optional: maximum characters to log for request/response bodies (default `4096`, set to `0` to disable)
+- `log_stream_text_preview_chars` optional: maximum characters to log for streaming response preview (default `256`, set to `0` to disable)
+- `providers` required: array of upstream service providers
+  - `base_url` required: base URL of upstream service (e.g., `https://api.example.com`)
+    - The completions endpoint will be constructed as `{base_url}/v1/chat/completions`
+  - `api_key` required: used for upstream auth, sent as `Authorization: Bearer ...`
+  - `models` required: array of model objects to expose via `/v1/models` endpoint
+    - `id` required: model identifier used by clients (e.g., `glm`)
+    - `display_name` optional: display name (defaults to `id` if not provided)
+    - `remote_id` optional: model ID sent to upstream service (defaults to `id` if not provided)
 
-Do not commit your real `nvidia_key`.
+Example:
 
-## Env (optional overrides)
+```json
+{
+  "ak": "your-proxy-api-key",
+  "port": 8888,
+  "upstream_timeout_seconds": 300,
+  "log_body_max_chars": 4096,
+  "log_stream_text_preview_chars": 256,
+  "providers": [
+    {
+      "base_url": "https://api.example.com",
+      "api_key": "your-upstream-api-key",
+      "models": [
+        {
+          "id": "glm",
+          "display_name": "glm4.7",
+          "remote_id": "deepseek-chat"
+        },
+        {
+          "id": "minimax",
+          "display_name": "minimax2.1",
+          "remote_id": "mimo-v2-flash"
+        }
+      ]
+    }
+  ]
+}
+```
 
-- `CONFIG_PATH` default `config.json` (relative to `go/`)
-- `PROVIDER_API_KEY` optional: overrides `nvidia_key` from config
-- `UPSTREAM_URL` optional: overrides `nvidia_url` from config
-- `SERVER_API_KEY` optional: enable inbound auth; accepts `Authorization: Bearer ...` or `x-api-key: ...`
-- `ADDR` default `:3001`
-- `UPSTREAM_TIMEOUT_SECONDS` default `300`
-- `LOG_BODY_MAX_CHARS` default `4096` (`0` disables body logging)
-- `LOG_STREAM_TEXT_PREVIEW_CHARS` default `256` (`0` disables stream preview logging)
+Do not commit your real `ak` or `api_key` values.
+
+## Env
+
+- `CONFIG_PATH` default `config.json` (relative to working directory)
 
 ## Run
 
@@ -32,62 +64,125 @@ Do not commit your real `nvidia_key`.
 go run .
 ```
 
+Or build and run:
+
+```bash
+go build -o claude-proxy
+./claude-proxy
+```
+
 ## CLAUDE CODE
 
-use zai/glm4.7 model
+use glm model:
 ```bash
-export ANTHROPIC_BASE_URL=http://localhost:3001
-export ANTHROPIC_AUTH_TOKEN=nvapi-api-key
-export ANTHROPIC_DEFAULT_HAIKU_MODEL=z-ai/glm4.7
-export ANTHROPIC_DEFAULT_SONNET_MODEL=z-ai/glm4.7
-export ANTHROPIC_DEFAULT_OPUS_MODEL=z-ai/glm4.7
+export ANTHROPIC_BASE_URL=http://localhost:8888
+export ANTHROPIC_AUTH_TOKEN=your-proxy-api-key
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=glm
+export ANTHROPIC_DEFAULT_SONNET_MODEL=glm
+export ANTHROPIC_DEFAULT_OPUS_MODEL=glm
 
 claude
 ```
 
-use zai/glm4.7 model
+use minimax model:
 ```bash
-export ANTHROPIC_BASE_URL=http://localhost:3001
-export ANTHROPIC_AUTH_TOKEN=nvapi-api-key
-export ANTHROPIC_DEFAULT_HAIKU_MODEL=minimaxai/minimax-m2.1
-export ANTHROPIC_DEFAULT_SONNET_MODEL=minimaxai/minimax-m2.1
-export ANTHROPIC_DEFAULT_OPUS_MODEL=minimaxai/minimax-m2.1
+export ANTHROPIC_BASE_URL=http://localhost:8888
+export ANTHROPIC_AUTH_TOKEN=your-proxy-api-key
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=minimax
+export ANTHROPIC_DEFAULT_SONNET_MODEL=minimax
+export ANTHROPIC_DEFAULT_OPUS_MODEL=minimax
 
 claude
 ```
 
 ## API
 
-### POST /v1/messages
+### GET /v1/models
+
+Returns the list of available models configured in `config.json`.
 
 - Inbound auth:
-  - If `SERVER_API_KEY` is set, you must send `Authorization: Bearer <SERVER_API_KEY>` (or `x-api-key: <SERVER_API_KEY>`).
+  - If `ak` is set in config, you must send `Authorization: Bearer <ak>` (or `x-api-key: <ak>`).
+
+Response format (Anthropic style):
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "glm",
+      "object": "model",
+      "created": 1234567890,
+      "display_name": "glm4.7"
+    },
+    {
+      "id": "minimax",
+      "object": "model",
+      "created": 1234567890,
+      "display_name": "minimax2.1"
+    }
+  ]
+}
+```
+
+Example:
+
+```bash
+curl -sS http://127.0.0.1:8888/v1/models \
+  -H 'Authorization: Bearer your-proxy-api-key'
+```
+
+### POST /v1/messages
+
+Sends a message to the upstream service.
+
+- Inbound auth:
+  - If `ak` is set in config, you must send `Authorization: Bearer <ak>` (or `x-api-key: <ak>`).
 - Upstream auth:
-  - Always sends `Authorization: Bearer <nvidia_key>` to NVIDIA.
+  - Always sends `Authorization: Bearer <api_key>` to upstream.
+- Model mapping:
+  - The `model` field in the request uses the client-side `id` (e.g., `glm`)
+  - The proxy converts it to the upstream `remote_id` (e.g., `deepseek-chat`) before forwarding
 
 Example (non-stream):
 
 ```bash
-curl -sS http://127.0.0.1:3001/v1/messages \
+curl -sS http://127.0.0.1:8888/v1/messages \
   -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer your-proxy-api-key' \
   -d '{
-    "model":"z-ai/glm4.7",
-    "max_tokens":256,
-    "messages":[{"role":"user","content":"hello"}]
+    "model": "glm",
+    "max_tokens": 256,
+    "messages": [{"role": "user", "content": "hello"}]
   }'
 ```
 
 Example (stream):
 
 ```bash
-curl -N http://127.0.0.1:3001/v1/messages \
+curl -N http://127.0.0.1:8888/v1/messages \
   -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer your-proxy-api-key' \
   -d '{
-    "model":"z-ai/glm4.7",
-    "max_tokens":256,
-    "stream":true,
-    "messages":[{"role":"user","content":"hello"}]
+    "model": "glm",
+    "max_tokens": 256,
+    "stream": true,
+    "messages": [{"role": "user", "content": "hello"}]
   }'
+```
+
+### GET /
+
+Health check endpoint.
+
+Response:
+
+```json
+{
+  "message": "claude-proxy",
+  "health": "ok"
+}
 ```
 
 ## Build
@@ -95,59 +190,36 @@ curl -N http://127.0.0.1:3001/v1/messages \
 This project uses only Go stdlib (no external deps). If your environment blocks the default Go build cache path, set:
 
 ```bash
-export GOCACHE=/tmp/go-build-cache
-export GOMODCACHE=/tmp/gomodcache
+export GOCACHE=/tmp/tmp-go-build-cache
+export GOMODCACHE=/tmp/tmp-gomodcache
 ```
 
 Linux (amd64):
 
 ```bash
 mkdir -p dist
-GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/claude-nvidia-proxy_linux_amd64 .
+GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/claude-proxy_linux_amd64 .
 ```
 
 Windows (amd64):
 
 ```bash
 mkdir -p dist
-GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/claude-nvidia-proxy_windows_amd64.exe .
+GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/claude-proxy_windows_amd64.exe .
 ```
 
-## API
-
-### POST /v1/messages
-
-- Inbound auth:
-  - If `SERVER_API_KEY` is set, you must send `Authorization: Bearer <SERVER_API_KEY>` (or `x-api-key: <SERVER_API_KEY>`).
-- Upstream auth:
-  - Always sends `Authorization: Bearer <nvidia_key>` to NVIDIA.
-
-Example (non-stream):
+macOS (arm64):
 
 ```bash
-curl -sS http://127.0.0.1:3001/v1/messages \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model":"z-ai/glm4.7",
-    "max_tokens":256,
-    "messages":[{"role":"user","content":"hello"}]
-  }'
-```
-
-Example (stream):
-
-```bash
-curl -N http://127.0.0.1:3001/v1/messages \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model":"z-ai/glm4.7",
-    "max_tokens":256,
-    "stream":true,
-    "messages":[{"role":"user","content":"hello"}]
-  }'
+mkdir -p dist
+GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o dist/claude-proxy_darwin_arm64 .
 ```
 
 ## Notes / Limitations
 
-- Streaming conversion supports `delta.content` text and `delta.tool_calls` tool-use blocks; other Anthropic blocks are not fully implemented.
-- Logs show forwarded request bodies; keep `LOG_BODY_MAX_CHARS` small and avoid secrets in prompts.
+- Multiple providers can be configured, each with their own `base_url`, `api_key`, and models
+- Model IDs are mapped from client-side `id` to upstream `remote_id` before forwarding requests
+- Streaming conversion supports `delta.content` text and `delta.tool_calls` tool-use blocks; other Anthropic blocks are not fully implemented
+- Logs show forwarded request bodies; keep `log_body_max_chars` small and avoid secrets in prompts
+- The `/v1/models` endpoint returns a static list from config, not from the upstream service
+- All configuration is read from `config.json`; environment variable overrides are not supported (except `CONFIG_PATH`)

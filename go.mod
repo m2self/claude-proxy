@@ -1,4 +1,4 @@
-module claude-nvidia-proxy
+module claude-proxy
 
 go 1.22
 

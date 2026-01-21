@@ -1,4 +1,28 @@
 {
-  "nvidia_url": "https://integrate.api.nvidia.com/v1/chat/completions",
-  "nvidia_key": "nvapi-api-key"
+  "port": 8888,
+  "ak": "sk-forgives-claude-proxy",
+  "providers": [
+    {
+      "base_url": "https://aaaa.com",
+      "api_key": "sk-1",
+      "models": [
+        {
+          "id": "glm",
+          "display_name": "glm4.7",
+          "remote_id": "deepseek-chat"
+        }
+      ]
+    },
+    {
+      "base_url": "https://bbbb.com",
+      "api_key": "sk-2",
+      "models": [
+        {
+          "id": "minimax",
+          "display_name": "minimax2.1",
+          "remote_id": "deepseek-think"
+        }
+      ]
+    }
+  ]
 }
